@@ -50,7 +50,7 @@ impl core::fmt::Display for Temperature {
     }
 }
 
-pub async fn search<R: RxChannelAsync, T: TxChannelAsync>(ow: &mut OneWire<R, T>) -> () {
+pub async fn search<'a, CFG: OneWireConfig>(ow: &mut OneWire<'a, CFG>) -> () {
     let mut search = Search::new();
     loop {
         match search.next(ow).await {

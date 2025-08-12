@@ -2,33 +2,60 @@
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
 
-use esp_hal as hal;
-
+use core::marker::PhantomData;
 use embassy_futures::select::*;
-use hal::gpio::interconnect::*;
-use hal::gpio::{Flex, InputPin, Level, OutputPin, Pull};
-use hal::peripheral::*;
-use hal::rmt::{
-    PulseCode, RxChannelAsync, RxChannelConfig, RxChannelCreatorAsync, TxChannelAsync,
-    TxChannelConfig, TxChannelCreatorAsync,
+use esp_hal::{
+    gpio::{
+        interconnect::*, DriveMode, DriveStrength, Flex, InputConfig, Level, OutputConfig, Pin,
+        Pull,
+    },
+    rmt::{
+        Channel, PulseCode, RxChannelAsync, RxChannelConfig, RxChannelCreator, RxChannelInternal,
+        TxChannelAsync, TxChannelConfig, TxChannelCreator, TxChannelInternal,
+    },
+    Async,
 };
 
-pub struct OneWire<R: RxChannelAsync, T: TxChannelAsync> {
-    rx: R,
-    tx: T,
-    input: InputSignal,
+pub trait OneWireConfig {
+    type Rx: RxChannelAsync;
+    type Tx: TxChannelAsync;
+    type TxRaw: TxChannelInternal;
 }
 
-impl<'d, R: RxChannelAsync, T: TxChannelAsync> OneWire<R, T> {
+#[derive(Default)]
+pub struct OneWireConfigZST<Rx: RxChannelAsync, Tx: TxChannelAsync, TxRaw: TxChannelInternal>(
+    PhantomData<Rx>,
+    PhantomData<Tx>,
+    PhantomData<TxRaw>,
+);
+
+impl<R: RxChannelAsync, T: TxChannelAsync, TR: TxChannelInternal> OneWireConfig
+    for OneWireConfigZST<R, T, TR>
+{
+    type Rx = R;
+    type Tx = T;
+    type TxRaw = TR;
+}
+
+pub struct OneWire<'a, C: OneWireConfig> {
+    rx: C::Rx,
+    tx: C::Tx,
+    input: InputSignal<'a>,
+    txchan: C::TxRaw, // Used for clearing a transmit transaction without driver support.
+}
+
+impl<'a, Rx: RxChannelInternal, Tx: TxChannelInternal>
+    OneWire<'a, OneWireConfigZST<Channel<Async, Rx>, Channel<Async, Tx>, Tx>>
+{
     pub fn new<
-        Tx: TxChannelCreatorAsync<'d, T, OutputSignal>,
-        Rx: RxChannelCreatorAsync<'d, R, InputSignal>,
-        P: 'd + InputPin + OutputPin + Peripheral<P = P>,
-    >(
-        txcc: Tx,
-        rxcc: Rx,
+        Txc: TxChannelCreator<'a, Async, Raw = Tx>,
+        Rxc: RxChannelCreator<'a, Async, Raw = Rx>,
+        P: Pin + 'a,
+        >(
+        txcc: Txc,
+        rxcc: Rxc,
         pin: P,
-    ) -> Result<OneWire<R, T>, Error> {
+    ) -> Result<Self, Error> {
         let rx_config = RxChannelConfig::default()
             .with_clk_divider(80)
             .with_idle_threshold(1000)
@@ -38,31 +65,35 @@ impl<'d, R: RxChannelAsync, T: TxChannelAsync> OneWire<R, T> {
             .with_clk_divider(80)
             .with_carrier_modulation(false);
 
-        let mut pin: Flex = Flex::new(pin.into());
+        let mut pin: Flex = Flex::new(pin);
 
-        // Clone the pin so we can still overwrite the (wrong) config set by the rmt tx and rx driver setup:
-        let (insig, outsig) = unsafe { pin.clone_unchecked() }.split();
+        pin.apply_input_config(&InputConfig::default().with_pull(Pull::Up));
+        pin.apply_output_config(
+            &OutputConfig::default()
+                .with_drive_mode(DriveMode::OpenDrain)
+                .with_drive_strength(DriveStrength::_40mA),
+        );
+        pin.set_input_enable(true);
+        pin.set_output_enable(true);
+        let (input, output) = pin.split();
 
         let tx = txcc
-            .configure(outsig.inverted(), tx_config)
+            .configure_tx(output.with_output_inverter(true), tx_config)
             .map_err(Error::SendError)?;
         let rx = rxcc
-            .configure(insig.inverted(), rx_config)
+            .configure_rx(input.clone().with_input_inverter(true), rx_config)
             .map_err(Error::ReceiveError)?;
 
-        // Then we set the pin up correctly:
-        pin.set_as_open_drain(Pull::Up);
-        pin.set_drive_strength(hal::gpio::DriveStrength::_40mA);
-        pin.enable_input(true);
-
-        // and connect the physical peripherals back up to the GPIO matrix:
-        let (input, outsig) = pin.split();
-        R::input_signal().connect_to(input.clone().inverted());
-        T::output_signal().connect_to(outsig.inverted());
-
-        Ok(OneWire { rx, tx, input })
+        Ok(OneWire {
+            rx,
+            tx,
+            input,
+            txchan: Txc::RAW,
+        })
     }
+}
 
+impl<'a, CFG: OneWireConfig> OneWire<'a, CFG> {
     pub async fn reset(&mut self) -> Result<bool, Error> {
         let data = [
             PulseCode::new(Level::Low, 60, Level::High, 600),
@@ -95,7 +126,9 @@ impl<'d, R: RxChannelAsync, T: TxChannelAsync> OneWire<R, T> {
             r
         })
         .await;
-        T::stop(); // Need to use the internal interface to stop our TX-based timeout here.
+        // Still need to use the internal interface to cancel the TX-based timeout.
+        self.txchan.stop_tx();
+
         match res {
             Either::First(Ok(r)) => Ok(r),
             Either::First(Err(r)) => Err(Error::ReceiveError(r)),
@@ -276,9 +309,9 @@ impl Search {
             complete: false,
         }
     }
-    pub async fn next<'d, R: RxChannelAsync, T: TxChannelAsync>(
+    pub async fn next<'d, CFG: OneWireConfig>(
         &mut self,
-        ow: &mut OneWire<R, T>,
+        ow: &mut OneWire<'d, CFG>,
     ) -> Result<Address, SearchError> {
         if self.complete {
             return Err(SearchError::SearchComplete);
