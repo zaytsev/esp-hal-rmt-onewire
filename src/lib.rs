@@ -1,19 +1,17 @@
 #![no_std]
-#![allow(incomplete_features)]
-#![feature(generic_const_exprs)]
 
 use core::marker::PhantomData;
 use embassy_futures::select::*;
 use esp_hal::{
+    Async,
     gpio::{
-        interconnect::*, DriveMode, DriveStrength, Flex, InputConfig, Level, OutputConfig, Pin,
-        Pull,
+        DriveMode, DriveStrength, Flex, InputConfig, Level, OutputConfig, Pin, Pull,
+        interconnect::*,
     },
     rmt::{
         Channel, PulseCode, RxChannelAsync, RxChannelConfig, RxChannelCreator, RxChannelInternal,
         TxChannelAsync, TxChannelConfig, TxChannelCreator, TxChannelInternal,
     },
-    Async,
 };
 
 pub trait OneWireConfig {
@@ -51,7 +49,7 @@ impl<'a, Rx: RxChannelInternal, Tx: TxChannelInternal>
         Txc: TxChannelCreator<'a, Async, Raw = Tx>,
         Rxc: RxChannelCreator<'a, Async, Raw = Rx>,
         P: Pin + 'a,
-        >(
+    >(
         txcc: Txc,
         rxcc: Rxc,
         pin: P,
@@ -92,6 +90,8 @@ impl<'a, Rx: RxChannelInternal, Tx: TxChannelInternal>
         })
     }
 }
+
+pub const MAX_BITS: usize = 32;
 
 impl<'a, CFG: OneWireConfig> OneWire<'a, CFG> {
     pub async fn reset(&mut self) -> Result<bool, Error> {
@@ -160,11 +160,7 @@ impl<'a, CFG: OneWireConfig> OneWire<'a, CFG> {
 
     pub fn decode_bit(code: u32) -> bool {
         let len = code.length1();
-        if len < 20 {
-            true
-        } else {
-            false
-        }
+        if len < 20 { true } else { false }
     }
 
     pub async fn exchange_byte(&mut self, byte: u8) -> Result<u8, Error> {
@@ -195,16 +191,20 @@ impl<'a, CFG: OneWireConfig> OneWire<'a, CFG> {
     pub async fn exchange_bits<const N: usize>(
         &mut self,
         bits: [bool; N],
-    ) -> Result<[bool; N], Error>
-    where
-        [(); N + 1]:,
-    {
-        let mut data = [PulseCode::empty(); N + 1];
-        let mut indata = [PulseCode::empty(); N + 1];
+    ) -> Result<[bool; N], Error> {
+        if N > MAX_BITS {
+            panic!("exchange bits length exceeded MAX_BITS")
+        }
+
+        let mut data = [PulseCode::empty(); MAX_BITS + 1];
+        let mut indata = [PulseCode::empty(); MAX_BITS + 1];
         for n in 0..N {
             data[n] = Self::encode_bit(bits[n]);
         }
-        let _res = self.send_and_receive(&mut indata, &data).await?;
+        let len = N + 1;
+        let _res = self
+            .send_and_receive(&mut indata[..len], &data[..len])
+            .await?;
         let mut res: [bool; N] = [false; N];
         for n in 0..N {
             res[n] = Self::decode_bit(indata[n]);
